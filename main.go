@@ -28,9 +28,10 @@ type BotHandler struct {
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		log.Println("⚠️ File .env tidak ditemukan")
+		log.Println("File .env tidak ditemukan")
 	}
 
+	// admin_id is telegram user id
 	adminID, _ := strconv.ParseInt(os.Getenv("ADMIN_ID"), 10, 64)
 	cfg := Config{
 		SpreadsheetID: os.Getenv("SPREADSHEET_ID"),
@@ -82,14 +83,13 @@ func authMiddleware(adminID int64) telebot.MiddlewareFunc {
 		return func(c telebot.Context) error {
 			if c.Sender().ID != adminID {
 				log.Printf("Akses ditolak untuk: %s (%d)", c.Sender().Username, c.Sender().ID)
-				return nil // Abaikan saja, bot tidak akan merespon
+				return nil
 			}
 			return next(c)
 		}
 	}
 }
 
-// Handler untuk membuat sheet baru secara manual
 func (h *BotHandler) handleCreateSheet(c telebot.Context) error {
 	args := c.Args()
 	if len(args) < 1 {
@@ -98,7 +98,6 @@ func (h *BotHandler) handleCreateSheet(c telebot.Context) error {
 
 	sheetName := args[0]
 
-	// Request buat sheet
 	addSheetReq := &sheets.BatchUpdateSpreadsheetRequest{
 		Requests: []*sheets.Request{
 			{
@@ -114,7 +113,6 @@ func (h *BotHandler) handleCreateSheet(c telebot.Context) error {
 		return c.Send("❌ Gagal membuat sheet (mungkin sudah ada atau nama tidak valid).")
 	}
 
-	// Tambahkan Header
 	header := []interface{}{"Tanggal", "Kategori", "Keterangan", "Masuk", "Keluar"}
 	valueRange := &sheets.ValueRange{Values: [][]interface{}{header}}
 	h.srv.Spreadsheets.Values.Append(h.config.SpreadsheetID, sheetName+"!A1", valueRange).ValueInputOption("USER_ENTERED").Do()
@@ -175,35 +173,59 @@ func (h *BotHandler) handleEntry(isIncome bool) func(c telebot.Context) error {
 	}
 }
 
-// Fungsi summary tetap sama namun menerima sheetName secara dinamis
 func (h *BotHandler) generateSummary(sheetName string) string {
+	// Get all rows from A2 to E (skipping header)
 	resp, err := h.srv.Spreadsheets.Values.Get(h.config.SpreadsheetID, sheetName+"!A2:E").Do()
 	if err != nil || len(resp.Values) == 0 {
-		return "✅ Berhasil dicatat."
+		return "✅ Catatan berhasil ditambahkan."
 	}
 
 	var totalIn, totalOut float64
-	catTotals := make(map[string]float64)
+	categoryBreakdown := make(map[string]float64)
 
 	for _, row := range resp.Values {
+		// Ensure the row has enough columns
 		if len(row) < 5 {
 			continue
 		}
-		in, _ := strconv.ParseFloat(strings.NewReplacer(".", "", ",", "").Replace(fmt.Sprint(row[3])), 64)
-		out, _ := strconv.ParseFloat(strings.NewReplacer(".", "", ",", "").Replace(fmt.Sprint(row[4])), 64)
+
+		// Parse Masuk (Col D / Index 3) and Keluar (Col E / Index 4)
+		inStr := strings.NewReplacer(".", "", ",", "").Replace(fmt.Sprint(row[3]))
+		outStr := strings.NewReplacer(".", "", ",", "").Replace(fmt.Sprint(row[4]))
+
+		in, _ := strconv.ParseFloat(inStr, 64)
+		out, _ := strconv.ParseFloat(outStr, 64)
 
 		totalIn += in
 		totalOut += out
+
+		// Group by Category (Col B / Index 1) if it's an expense
 		if out > 0 {
-			cat := fmt.Sprint(row[1])
-			catTotals[cat] += out
+			catName := fmt.Sprint(row[1])
+			if catName == "" {
+				catName = "Lain-lain"
+			}
+			categoryBreakdown[catName] += out
 		}
 	}
 
-	res := fmt.Sprintf("📊 *RINGKASAN: %s*\n", strings.ToUpper(sheetName))
-	res += fmt.Sprintf("💰 Masuk: *Rp %.0f*\n", totalIn)
-	res += fmt.Sprintf("💸 Keluar: *Rp %.0f*\n", totalOut)
-	res += fmt.Sprintf("⚖️ Saldo: *Rp %.0f*", totalIn-totalOut)
+	// Format the final message
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📊 *RINGKASAN: %s*\n", strings.ToUpper(sheetName)))
+	sb.WriteString(fmt.Sprintf("───────────────────\n"))
+	sb.WriteString(fmt.Sprintf("📥 *Masuk:* Rp %.0f\n", totalIn))
+	sb.WriteString(fmt.Sprintf("📤 *Keluar:* Rp %.0f\n", totalOut))
+	sb.WriteString(fmt.Sprintf("⚖️ *Sisa:* Rp %.0f\n", totalIn-totalOut))
+	sb.WriteString(fmt.Sprintf("───────────────────\n"))
+	sb.WriteString("*Detail Per Kategori:*\n")
 
-	return res
+	if len(categoryBreakdown) == 0 {
+		sb.WriteString("_Belum ada data pengeluaran._")
+	} else {
+		for cat, total := range categoryBreakdown {
+			sb.WriteString(fmt.Sprintf("• %s: Rp %.0f\n", cat, total))
+		}
+	}
+
+	return sb.String()
 }
